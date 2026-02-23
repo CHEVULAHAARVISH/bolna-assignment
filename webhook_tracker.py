@@ -33,29 +33,55 @@ import asyncio
 import hashlib
 import hmac
 import json
-import pathlib
 import secrets
 from typing import Any
 
 import aiohttp
 from aiohttp import web
 
-from status_tracker.config import (
+from status_tracker import (
     DEFAULT_HUB,
     FEED_TOPICS,
     HUB_SIMULATE_INTERVAL,
     WEBHOOK_PORT,
 )
-from status_tracker.sse import SSEBus
 from status_tracker.tracker import IncidentTracker, print_incident
+
+
+# ── SSEBus (Server-Sent Events pub/sub) ───────────────────────────────────
+
+class SSEBus:
+    """Pub/sub bus for pushing incident events to SSE clients."""
+
+    def __init__(self) -> None:
+        self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
+        self._recent: list[dict[str, Any]] = []
+
+    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
+        if q in self._subscribers:
+            self._subscribers.remove(q)
+
+    async def publish(self, event: dict[str, Any]) -> None:
+        self._recent.append(event)
+        self._recent = self._recent[-50:]
+        for q in self._subscribers:
+            await q.put(event)
+
+    @property
+    def recent(self) -> list[dict[str, Any]]:
+        return list(self._recent)
+
 
 # ── Global State ────────────────────────────────────────────────────────────
 
 sse_bus = SSEBus()
 trackers: dict[str, IncidentTracker] = {}
 subscription_secrets: dict[str, str] = {}
-
-TEMPLATES_DIR = pathlib.Path(__file__).parent / "templates"
 
 
 # ── Incident Handling ───────────────────────────────────────────────────────
@@ -173,10 +199,129 @@ async def sse_handler(request: web.Request) -> web.StreamResponse:
     return resp
 
 
+INDEX_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenAI Status Tracker</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; line-height: 1.6; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.5rem; }
+  h2 { color: #58a6ff; margin: 2rem 0 0.75rem; font-size: 1.15rem; border-bottom: 1px solid #21262d; padding-bottom: 0.4rem; }
+  p, li { color: #8b949e; font-size: 0.9rem; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .badge { display: inline-block; background: #238636; color: #fff; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; margin-left: 0.5rem; }
+  pre { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.82rem; color: #c9d1d9; margin: 0.75rem 0; }
+  .arch { white-space: pre; font-size: 0.78rem; line-height: 1.4; }
+  ul { padding-left: 1.5rem; margin: 0.5rem 0; }
+  .feed { margin-top: 1rem; }
+  .event { background: #161b22; border-left: 3px solid #58a6ff; padding: 0.75rem 1rem; margin: 0.5rem 0; border-radius: 4px; }
+  .event .ts { color: #484f58; font-size: 0.78rem; }
+  .event .title { color: #c9d1d9; font-weight: bold; }
+  .event .status { color: #d29922; font-size: 0.85rem; }
+  .event .affected { color: #8b949e; font-size: 0.8rem; }
+  #waiting { color: #484f58; font-style: italic; }
+  .dot { display: inline-block; width: 8px; height: 8px; background: #238636; border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+</style>
+</head>
+<body>
+
+<h1>OpenAI Status Tracker <span class="badge">LIVE</span></h1>
+<p>Event-driven service tracking incidents from the <a href="https://status.openai.com/" target="_blank">OpenAI Status Page</a>.</p>
+
+<h2>Assignment</h2>
+<p>Build a Python script or lightweight app that automatically tracks and logs service updates from the OpenAI Status Page. Whenever there's a new incident, outage, or degradation update related to any OpenAI API product, the program should automatically detect the update and print the affected product/service and the latest status message.</p>
+<p style="margin-top:0.5rem">The solution must use an <strong>event-based approach</strong> that scales efficiently to 100+ status pages.</p>
+
+<h2>Architecture (WebSub / Webhook)</h2>
+<pre class="arch">┌──────────────┐  subscribe  ┌──────────────┐  polls   ┌──────────────┐
+│ Our Webhook  │ ──────────→ │  WebSub Hub  │ ───────→ │  Atom Feed   │
+│   Server     │             │              │          │ (OpenAI)     │
+│              │ ←──────────── │              │ ←─────── │              │
+│  /callback   │  POST push  │              │  200/304 │              │
+└──────────────┘             └──────────────┘          └──────────────┘
+       │
+       ├──→ Console output (stdout)
+       └──→ SSE stream (/events) ──→ This page (live updates below)</pre>
+
+<h2>How It Works</h2>
+<ul>
+  <li>A <strong>WebSub hub</strong> monitors the OpenAI Atom feed and POSTs new content to our <code>/callback</code> webhook when incidents change.</li>
+  <li>Our server <strong>never polls</strong> — it only reacts to incoming webhook POSTs (events).</li>
+  <li>Updates are pushed to this page via <strong>Server-Sent Events</strong> (SSE) — your browser never polls either.</li>
+  <li>Scales to 100+ feeds: one subscription per feed, O(1) work per event.</li>
+</ul>
+
+<h2>Endpoints</h2>
+<ul>
+  <li><code>GET /</code> — This page</li>
+  <li><code>GET /events</code> — SSE stream (try: <code>curl -N http://&lt;host&gt;:8080/events</code>)</li>
+  <li><code>POST /callback</code> — WebSub webhook receiver</li>
+  <li><code>GET /health</code> — Health check</li>
+</ul>
+
+<h2>Live Incident Feed <span class="dot"></span></h2>
+<div class="feed">
+  <p id="waiting">Listening for new incidents via SSE...</p>
+  <div id="events"></div>
+</div>
+
+<script>
+const es = new EventSource("/events");
+const container = document.getElementById("events");
+const waiting = document.getElementById("waiting");
+
+es.addEventListener("incident", function(e) {
+  waiting.style.display = "none";
+  const d = JSON.parse(e.data);
+  const div = document.createElement("div");
+  div.className = "event";
+
+  var ts = document.createElement("div");
+  ts.className = "ts";
+  ts.textContent = d.timestamp + " — " + d.provider;
+
+  var title = document.createElement("div");
+  title.className = "title";
+  title.textContent = d.incident;
+
+  var status = document.createElement("div");
+  status.className = "status";
+  status.textContent = "Status: " + d.status;
+
+  div.appendChild(ts);
+  div.appendChild(title);
+  div.appendChild(status);
+
+  if (d.affected && d.affected.length) {
+    var aff = document.createElement("div");
+    aff.className = "affected";
+    aff.textContent = "Affected: " + d.affected.join(", ");
+    div.appendChild(aff);
+  }
+
+  container.prepend(div);
+});
+
+es.onerror = function() {
+  waiting.textContent = "SSE connection lost. Reconnecting...";
+  waiting.style.display = "block";
+};
+</script>
+
+</body>
+</html>
+"""
+
+
 async def index_handler(request: web.Request) -> web.Response:
-    """Serve the web UI from templates/index.html."""
-    page = (TEMPLATES_DIR / "index.html").read_text()
-    return web.Response(text=page, content_type="text/html")
+    """Serve the web UI."""
+    return web.Response(text=INDEX_HTML, content_type="text/html")
 
 
 # ── WebSub Subscription ────────────────────────────────────────────────────

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import aiohttp
 import feedparser
 
-from status_tracker.config import FEED_TOPICS, POLL_INTERVAL
+from status_tracker import FEED_TOPICS, POLL_INTERVAL
 from status_tracker.tracker import IncidentTracker, print_incident
 
 
