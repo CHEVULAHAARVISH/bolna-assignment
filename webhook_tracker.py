@@ -232,13 +232,17 @@ INDEX_HTML = """\
 <body>
 
 <h1>OpenAI Status Tracker <span class="badge">LIVE</span></h1>
-<p>Event-driven service tracking incidents from the <a href="https://status.openai.com/" target="_blank">OpenAI Status Page</a>.</p>
+<p>This submission includes <strong>two solutions</strong> for tracking incidents from the <a href="https://status.openai.com/" target="_blank">OpenAI Status Page</a> — a practical polling approach and a truly event-driven webhook architecture.</p>
 
 <h2>Assignment</h2>
 <p>Build a Python script or lightweight app that automatically tracks and logs service updates from the OpenAI Status Page. Whenever there's a new incident, outage, or degradation update related to any OpenAI API product, the program should automatically detect the update and print the affected product/service and the latest status message.</p>
 <p style="margin-top:0.5rem">The solution must use an <strong>event-based approach</strong> that scales efficiently to 100+ status pages.</p>
 
-<h2>Architecture (WebSub / Webhook)</h2>
+<h2>Solution 1: Simple Tracker (Efficient Polling)</h2>
+<p><code>simple_tracker.py</code> — Uses the Atom feed with conditional HTTP requests (<code>ETag</code> + <code>Last-Modified</code>). The server returns <code>304 Not Modified</code> when nothing has changed, so data is only downloaded on actual updates. Each feed runs as its own <code>asyncio</code> task — add 100 feeds and they all run concurrently in a single process.</p>
+<pre>python simple_tracker.py</pre>
+
+<h2>Solution 2: Webhook Tracker (Event-Driven — WebSub) <span class="badge">THIS PAGE</span></h2>
 <pre class="arch">┌──────────────┐  subscribe  ┌──────────────┐  polls   ┌──────────────┐
 │ Our Webhook  │ ──────────→ │  WebSub Hub  │ ───────→ │  Atom Feed   │
 │   Server     │             │              │          │ (OpenAI)     │
