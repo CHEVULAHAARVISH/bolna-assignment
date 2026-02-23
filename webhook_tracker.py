@@ -32,185 +32,58 @@ import argparse
 import asyncio
 import hashlib
 import hmac
-import html
 import json
-import re
+import pathlib
 import secrets
-from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
 from aiohttp import web
-import feedparser
 
+from status_tracker.config import (
+    DEFAULT_HUB,
+    FEED_TOPICS,
+    HUB_SIMULATE_INTERVAL,
+    WEBHOOK_PORT,
+)
+from status_tracker.sse import SSEBus
+from status_tracker.tracker import IncidentTracker, print_incident
 
-# ── Configuration ────────────────────────────────────────────────────────────
-
-FEED_TOPICS: list[dict[str, str]] = [
-    {
-        "name": "OpenAI",
-        "topic": "https://status.openai.com/feed.atom",
-    },
-    # Add more feeds — each gets a separate hub subscription:
-    # {"name": "GitHub", "topic": "https://www.githubstatus.com/history.atom"},
-]
-
-DEFAULT_HUB = "https://push.superfeedr.com/"
-WEBHOOK_PORT = 8080
-HUB_SIMULATE_INTERVAL = 30  # seconds, only used with --simulate-hub
-
-
-# ── SSE Event Bus ────────────────────────────────────────────────────────────
-
-class SSEBus:
-    """Pub/sub bus for pushing incident events to SSE clients."""
-
-    def __init__(self) -> None:
-        self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
-        self._recent: list[dict[str, Any]] = []  # last 50 events for new clients
-
-    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
-        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
-        if q in self._subscribers:
-            self._subscribers.remove(q)
-
-    async def publish(self, event: dict[str, Any]) -> None:
-        self._recent.append(event)
-        self._recent = self._recent[-50:]
-        for q in self._subscribers:
-            await q.put(event)
-
-    @property
-    def recent(self) -> list[dict[str, Any]]:
-        return list(self._recent)
-
+# ── Global State ────────────────────────────────────────────────────────────
 
 sse_bus = SSEBus()
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def strip_html(text: str) -> str:
-    clean = re.sub(r"<br\s*/?>", "\n", text)
-    clean = re.sub(r"<li>", "  - ", clean)
-    clean = re.sub(r"<[^>]+>", "", clean)
-    return html.unescape(clean).strip()
-
-
-def parse_components(summary_html: str) -> list[str]:
-    items = re.findall(r"<li>\s*(.+?)\s*</li>", summary_html, re.DOTALL)
-    return [strip_html(c) for c in items]
-
-
-def parse_status(summary_html: str) -> str:
-    match = re.search(r"<b>Status:\s*(.+?)</b>(.*?)(?:<b>Affected|$)", summary_html, re.DOTALL)
-    if match:
-        status = strip_html(match.group(1))
-        detail = strip_html(match.group(2))
-        if detail:
-            return f"{status} — {detail}"
-        return status
-    return strip_html(summary_html)
-
-
-def format_ts(ts_str: str) -> str:
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            dt = datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
-            return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-    return ts_str
-
-
-# ── Incident State ───────────────────────────────────────────────────────────
-
-class IncidentTracker:
-    """Tracks seen incidents to only print new/updated ones."""
-
-    def __init__(self) -> None:
-        self._seen: dict[str, str] = {}  # incident_id -> last updated timestamp
-        self._initialized = False
-
-    def process_feed(self, provider: str, feed_body: str) -> None:
-        parsed = feedparser.parse(feed_body)
-        if not parsed.entries:
-            return
-
-        if not self._initialized:
-            # First time: silently record all existing incidents
-            for e in parsed.entries:
-                eid = e.get("id", e.get("link", ""))
-                self._seen[eid] = e.get("updated", e.get("published", ""))
-            print(f"[*] {provider}: baseline loaded ({len(parsed.entries)} incidents). Watching for new updates...\n")
-            self._initialized = True
-            return
-
-        for e in parsed.entries:
-            eid = e.get("id", e.get("link", ""))
-            updated = e.get("updated", e.get("published", ""))
-            prev = self._seen.get(eid)
-
-            if prev is None or updated != prev:
-                self._seen[eid] = updated
-                self._log(provider, e)
-
-    def _log(self, provider: str, entry: feedparser.FeedParserDict) -> None:
-        title = entry.get("title", "Unknown Incident")
-        updated = entry.get("updated", entry.get("published", ""))
-        summary_html = entry.get("summary", "")
-
-        status = parse_status(summary_html)
-        components = parse_components(summary_html)
-        ts = format_ts(updated)
-
-        product = f"{provider} API"
-        if components:
-            product += f" - {', '.join(components)}"
-
-        print(f"[{ts}] Product: {product}")
-        print(f"Status: {status}")
-        print()
-
-        # Push to SSE clients
-        event = {
-            "timestamp": ts,
-            "provider": provider,
-            "incident": title,
-            "product": product,
-            "status": status,
-            "affected": components,
-        }
-        asyncio.create_task(sse_bus.publish(event))
-
-
-# Per-topic trackers
 trackers: dict[str, IncidentTracker] = {}
+subscription_secrets: dict[str, str] = {}
+
+TEMPLATES_DIR = pathlib.Path(__file__).parent / "templates"
+
+
+# ── Incident Handling ───────────────────────────────────────────────────────
+
+def handle_incident(incident: dict[str, Any]) -> None:
+    """Print incident and push to SSE clients."""
+    print_incident(incident)
+    task = asyncio.create_task(sse_bus.publish(incident))
+    task.add_done_callback(
+        lambda t: t.exception() if not t.cancelled() and t.exception() else None
+    )
 
 
 def get_tracker(topic_url: str) -> tuple[IncidentTracker, str]:
     """Get or create a tracker for a topic URL. Returns (tracker, provider_name)."""
     for feed in FEED_TOPICS:
-        if feed["topic"] == topic_url:
+        if feed["url"] == topic_url:
             name = feed["name"]
             if topic_url not in trackers:
-                trackers[topic_url] = IncidentTracker()
+                trackers[topic_url] = IncidentTracker(on_incident=handle_incident)
             return trackers[topic_url], name
     # Unknown topic
     if topic_url not in trackers:
-        trackers[topic_url] = IncidentTracker()
+        trackers[topic_url] = IncidentTracker(on_incident=handle_incident)
     return trackers[topic_url], topic_url
 
 
-# ── WebSub Webhook Handler ──────────────────────────────────────────────────
-
-# Secret per subscription for HMAC verification
-subscription_secrets: dict[str, str] = {}
-
+# ── WebSub Webhook Handlers ────────────────────────────────────────────────
 
 async def callback_get(request: web.Request) -> web.Response:
     """
@@ -237,16 +110,17 @@ async def callback_post(request: web.Request) -> web.Response:
     """
     body = await request.read()
 
-    # Determine which topic this is for (from Link header or stored mapping)
+    # Determine which topic this is for (from Link header or body content)
     topic = None
     link_header = request.headers.get("Link", "")
     for feed in FEED_TOPICS:
-        if feed["topic"] in link_header or feed["topic"] in body.decode("utf-8", errors="ignore"):
-            topic = feed["topic"]
+        if feed["url"] in link_header or feed["url"] in body.decode("utf-8", errors="ignore"):
+            topic = feed["url"]
             break
 
     if topic is None and FEED_TOPICS:
-        topic = FEED_TOPICS[0]["topic"]
+        topic = FEED_TOPICS[0]["url"]
+        print(f"[warn] Could not match webhook POST to a known topic — defaulting to {topic}")
 
     # Optional: verify HMAC signature
     sig_header = request.headers.get("X-Hub-Signature", "")
@@ -263,6 +137,8 @@ async def callback_post(request: web.Request) -> web.Response:
 
     return web.Response(status=200, text="OK")
 
+
+# ── HTTP Handlers ───────────────────────────────────────────────────────────
 
 async def health(request: web.Request) -> web.Response:
     return web.Response(text="OK")
@@ -298,108 +174,12 @@ async def sse_handler(request: web.Request) -> web.StreamResponse:
 
 
 async def index_handler(request: web.Request) -> web.Response:
-    """Index page: assignment overview + architecture + live incident feed."""
-    page = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenAI Status Tracker</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; line-height: 1.6; padding: 2rem; max-width: 900px; margin: 0 auto; }
-  h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.5rem; }
-  h2 { color: #58a6ff; margin: 2rem 0 0.75rem; font-size: 1.15rem; border-bottom: 1px solid #21262d; padding-bottom: 0.4rem; }
-  p, li { color: #8b949e; font-size: 0.9rem; }
-  a { color: #58a6ff; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .badge { display: inline-block; background: #238636; color: #fff; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; margin-left: 0.5rem; }
-  pre { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.82rem; color: #c9d1d9; margin: 0.75rem 0; }
-  .arch { white-space: pre; font-size: 0.78rem; line-height: 1.4; }
-  ul { padding-left: 1.5rem; margin: 0.5rem 0; }
-  .feed { margin-top: 1rem; }
-  .event { background: #161b22; border-left: 3px solid #58a6ff; padding: 0.75rem 1rem; margin: 0.5rem 0; border-radius: 4px; }
-  .event .ts { color: #484f58; font-size: 0.78rem; }
-  .event .title { color: #c9d1d9; font-weight: bold; }
-  .event .status { color: #d29922; font-size: 0.85rem; }
-  .event .affected { color: #8b949e; font-size: 0.8rem; }
-  #waiting { color: #484f58; font-style: italic; }
-  .dot { display: inline-block; width: 8px; height: 8px; background: #238636; border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-</style>
-</head>
-<body>
-
-<h1>OpenAI Status Tracker <span class="badge">LIVE</span></h1>
-<p>Event-driven service tracking incidents from the <a href="https://status.openai.com/" target="_blank">OpenAI Status Page</a>.</p>
-
-<h2>Assignment</h2>
-<p>Build a Python script or lightweight app that automatically tracks and logs service updates from the OpenAI Status Page. Whenever there's a new incident, outage, or degradation update related to any OpenAI API product, the program should automatically detect the update and print the affected product/service and the latest status message.</p>
-<p style="margin-top:0.5rem">The solution must use an <strong>event-based approach</strong> that scales efficiently to 100+ status pages.</p>
-
-<h2>Architecture (WebSub / Webhook)</h2>
-<pre class="arch">┌──────────────┐  subscribe  ┌──────────────┐  polls   ┌──────────────┐
-│ Our Webhook  │ ──────────→ │  WebSub Hub  │ ───────→ │  Atom Feed   │
-│   Server     │             │              │          │ (OpenAI)     │
-│              │ ←────────── │              │ ←─────── │              │
-│  /callback   │  POST push  │              │  200/304 │              │
-└──────────────┘             └──────────────┘          └──────────────┘
-       │
-       ├──→ Console output (stdout)
-       └──→ SSE stream (/events) ──→ This page (live updates below)</pre>
-
-<h2>How It Works</h2>
-<ul>
-  <li>A <strong>WebSub hub</strong> monitors the OpenAI Atom feed and POSTs new content to our <code>/callback</code> webhook when incidents change.</li>
-  <li>Our server <strong>never polls</strong> — it only reacts to incoming webhook POSTs (events).</li>
-  <li>Updates are pushed to this page via <strong>Server-Sent Events</strong> (SSE) — your browser never polls either.</li>
-  <li>Scales to 100+ feeds: one subscription per feed, O(1) work per event.</li>
-</ul>
-
-<h2>Endpoints</h2>
-<ul>
-  <li><code>GET /</code> — This page</li>
-  <li><code>GET /events</code> — SSE stream (try: <code>curl -N http://&lt;host&gt;:8080/events</code>)</li>
-  <li><code>POST /callback</code> — WebSub webhook receiver</li>
-  <li><code>GET /health</code> — Health check</li>
-</ul>
-
-<h2>Live Incident Feed <span class="dot"></span></h2>
-<div class="feed">
-  <p id="waiting">Listening for new incidents via SSE...</p>
-  <div id="events"></div>
-</div>
-
-<script>
-const es = new EventSource("/events");
-const container = document.getElementById("events");
-const waiting = document.getElementById("waiting");
-
-es.addEventListener("incident", function(e) {
-  waiting.style.display = "none";
-  const d = JSON.parse(e.data);
-  const div = document.createElement("div");
-  div.className = "event";
-  div.innerHTML =
-    '<div class="ts">' + d.timestamp + ' — ' + d.provider + '</div>' +
-    '<div class="title">' + d.incident + '</div>' +
-    '<div class="status">Status: ' + d.status + '</div>' +
-    (d.affected && d.affected.length ? '<div class="affected">Affected: ' + d.affected.join(", ") + '</div>' : '');
-  container.prepend(div);
-});
-
-es.onerror = function() {
-  waiting.textContent = "SSE connection lost. Reconnecting...";
-  waiting.style.display = "block";
-};
-</script>
-
-</body>
-</html>"""
+    """Serve the web UI from templates/index.html."""
+    page = (TEMPLATES_DIR / "index.html").read_text()
     return web.Response(text=page, content_type="text/html")
 
 
-# ── WebSub Subscription ─────────────────────────────────────────────────────
+# ── WebSub Subscription ────────────────────────────────────────────────────
 
 async def subscribe_to_hub(
     session: aiohttp.ClientSession,
@@ -435,7 +215,7 @@ async def subscribe_to_hub(
         return False
 
 
-# ── Hub Simulator (for local testing) ────────────────────────────────────────
+# ── Hub Simulator (for local testing) ──────────────────────────────────────
 
 async def simulate_hub(callback_url: str) -> None:
     """
@@ -448,10 +228,11 @@ async def simulate_hub(callback_url: str) -> None:
     etags: dict[str, str | None] = {}
     last_mods: dict[str, str | None] = {}
 
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             for feed in FEED_TOPICS:
-                topic = feed["topic"]
+                topic = feed["url"]
                 headers: dict[str, str] = {}
                 if etags.get(topic):
                     headers["If-None-Match"] = etags[topic]
@@ -493,13 +274,14 @@ async def simulate_hub(callback_url: str) -> None:
             await asyncio.sleep(HUB_SIMULATE_INTERVAL)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────
 
 async def run(args: argparse.Namespace) -> None:
+    port = args.port
+
     print("OpenAI Status Tracker (Event-Based — WebSub Webhook)")
     print()
 
-    # Start the webhook server
     app = web.Application()
     app.router.add_get("/", index_handler)
     app.router.add_get("/events", sse_handler)
@@ -509,25 +291,22 @@ async def run(args: argparse.Namespace) -> None:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"[*] Webhook server listening on port {WEBHOOK_PORT}")
+    print(f"[*] Webhook server listening on port {port}")
 
-    callback_url = args.callback_url or f"http://localhost:{WEBHOOK_PORT}/callback"
+    callback_url = args.callback_url or f"http://localhost:{port}/callback"
 
     if args.simulate_hub:
-        # Local testing mode: built-in hub simulator
-        print(f"[*] Mode: simulated hub (local testing)")
-        print(f"[*] The hub simulator polls the feed and POSTs to our webhook,")
-        print(f"    mimicking what a real WebSub hub does in production.\n")
+        print("[*] Mode: simulated hub (local testing)")
+        print("[*] The hub simulator polls the feed and POSTs to our webhook,")
+        print("    mimicking what a real WebSub hub does in production.\n")
 
-        # Pre-initialize trackers
         for feed in FEED_TOPICS:
-            subscription_secrets[feed["topic"]] = secrets.token_hex(20)
+            subscription_secrets[feed["url"]] = secrets.token_hex(20)
 
         asyncio.create_task(simulate_hub(callback_url))
     else:
-        # Production mode: subscribe to a real WebSub hub
         hub_url = args.hub_url or DEFAULT_HUB
         print(f"[*] Mode: WebSub hub subscription")
         print(f"[*] Hub: {hub_url}")
@@ -535,16 +314,13 @@ async def run(args: argparse.Namespace) -> None:
 
         async with aiohttp.ClientSession() as session:
             for feed in FEED_TOPICS:
-                await subscribe_to_hub(session, hub_url, callback_url, feed["topic"])
+                await subscribe_to_hub(session, hub_url, callback_url, feed["url"])
 
-    # Run forever — we just wait for incoming webhook POSTs (events)
     print("[*] Waiting for events (incoming webhook POSTs)...\n")
     await asyncio.Event().wait()
 
 
 def main() -> None:
-    global WEBHOOK_PORT
-
     parser = argparse.ArgumentParser(
         description="OpenAI Status Tracker — Event-Based (WebSub Webhook)"
     )
@@ -568,7 +344,6 @@ def main() -> None:
         help=f"Port for the webhook server (default: {WEBHOOK_PORT})",
     )
     args = parser.parse_args()
-    WEBHOOK_PORT = args.port
 
     try:
         asyncio.run(run(args))
